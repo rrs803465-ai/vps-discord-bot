@@ -533,56 +533,50 @@ def sync_status(container_id: str, db_status: str) -> str:
 
 # ── sshx ───────────────────────────────────────────────────────────────────
 
-def _install_sshx(inst) -> bool:
-    env = {"HOME": "/root", "DEBIAN_FRONTEND": "noninteractive"}
-    find_cmd = (
-        "command -v sshx || "
-        "for p in /root/.local/bin/sshx /usr/local/bin/sshx /usr/bin/sshx; do "
-        "  [ -x \"$p\" ] && echo \"$p\" && break; done"
+# PATH used in every container exec — covers all known sshx install locations
+_CONTAINER_ENV = {
+    "HOME": "/root",
+    "DEBIAN_FRONTEND": "noninteractive",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin:/snap/bin",
+}
+
+# Canonical install target — always symlinked here so nohup finds it
+_SSHX_BIN = "/usr/local/bin/sshx"
+
+# Explicit path check only — no find/glob that can produce noise lines
+_SSHX_SEARCH_CMD = (
+    "for p in /root/.local/bin/sshx /usr/local/bin/sshx /usr/bin/sshx; do "
+    "  [ -f \"$p\" ] && [ -x \"$p\" ] && echo \"$p\" && exit 0; done; exit 1"
+)
+
+
+def _fix_container_dns(inst) -> None:
+    """
+    LXD containers sometimes boot with no DNS configured.
+    Write a working resolv.conf before any network call.
+    Uses Cloudflare (1.1.1.1) + Google (8.8.8.8) as fallback.
+    Also pings the target once to warm up the route.
+    """
+    env = _CONTAINER_ENV
+    fix_cmd = (
+        "echo 'nameserver 1.1.1.1' > /etc/resolv.conf && "
+        "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf && "
+        "echo 'nameserver 8.8.4.4' >> /etc/resolv.conf"
     )
     try:
-        check = _exec(inst, ["bash", "-c", find_cmd], environment=env)
-        found = (check.stdout or "").strip()
-        if found:
-            _ensure_symlinked(inst, found, env)
-            return True
-
-        curl_ok = _exec(inst, ["bash", "-c", "command -v curl"], environment=env)
-        if not (curl_ok.stdout or "").strip():
-            if not _apt_install_with_retry(inst, "curl", env):
-                return False
-
-        install_cmd = (
-            "curl --retry 3 --retry-delay 2 --retry-connrefused "
-            "--connect-timeout 10 -sSf https://sshx.io/get | sh"
-        )
-        for attempt in range(3):
-            result = _exec(inst, ["bash", "-c", install_cmd], environment=env)
-            if result.exit_code == 0:
-                break
-            time.sleep(2)
-
-        check2 = _exec(inst, ["bash", "-c", find_cmd], environment=env)
-        found  = (check2.stdout or "").strip()
-        if not found:
-            return False
-        _ensure_symlinked(inst, found, env)
-        return True
+        _exec(inst, ["bash", "-c", fix_cmd], environment=env)
+        # Verify DNS actually works now
+        verify = _exec(inst, ["bash", "-c",
+                               "nslookup sshx.io 1.1.1.1 >/dev/null 2>&1 && echo OK || echo FAIL"],
+                       environment=env)
+        status = (verify.stdout or "").strip()
+        print(f"[dns] resolv.conf patched — DNS check: {status}")
     except Exception as e:
-        print(f"[sshx install] {e}")
-        return False
+        print(f"[dns] fix failed (non-fatal): {e}")
 
 
-def _ensure_symlinked(inst, found_path: str, env: dict):
-    if found_path == "/usr/local/bin/sshx":
-        return
-    try:
-        _exec(inst, ["bash", "-c", f"ln -sf '{found_path}' /usr/local/bin/sshx"], environment=env)
-    except Exception:
-        pass
-
-
-def _apt_install_with_retry(inst, package: str, env: dict, attempts: int = 5) -> bool:
+def _apt_install_with_retry(inst, package: str, env: dict = None, attempts: int = 5) -> bool:
+    env = env or _CONTAINER_ENV
     wait_lock = (
         "for i in $(seq 1 30); do "
         "  fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 1; done"
@@ -599,27 +593,108 @@ def _apt_install_with_retry(inst, package: str, env: dict, attempts: int = 5) ->
     return False
 
 
-def _start_sshx_session(inst) -> str | None:
+def _install_sshx(inst) -> bool:
+    env = _CONTAINER_ENV
     try:
-        _exec(inst, ["bash", "-c", "pkill sshx 2>/dev/null; rm -f /tmp/sshx.log; true"])
+        # 0. Fix DNS before any network operation
+        _fix_container_dns(inst)
+
+        # 1. Check explicit known paths — no ambiguous output, no find
+        for candidate in ("/root/.local/bin/sshx", "/usr/local/bin/sshx", "/usr/bin/sshx"):
+            chk = _exec(inst, ["bash", "-c",
+                                f"[ -f '{candidate}' ] && [ -x '{candidate}' ] && echo FOUND || echo NOPE"],
+                        environment=env)
+            if "FOUND" in (chk.stdout or ""):
+                if candidate != _SSHX_BIN:
+                    _exec(inst, ["bash", "-c", f"ln -sf '{candidate}' {_SSHX_BIN}"],
+                          environment=env)
+                print(f"[sshx] already installed at {candidate}")
+                return True
+
+        # 2. Ensure curl is present
+        curl_check = _exec(inst, ["bash", "-c", "command -v curl && echo OK || echo MISSING"],
+                           environment=env)
+        if "MISSING" in (curl_check.stdout or ""):
+            print("[sshx] curl missing — installing...")
+            if not _apt_install_with_retry(inst, "curl", env):
+                print("[sshx] could not install curl — aborting")
+                return False
+
+        # 3. Run official installer — writes to /root/.local/bin/sshx
+        install_cmd = (
+            "curl --retry 5 --retry-delay 3 --retry-connrefused "
+            "--connect-timeout 15 -sSf https://sshx.io/get | sh"
+        )
+        print("[sshx] running installer...")
+        result = _exec(inst, ["bash", "-c", install_cmd], environment=env)
+        print(f"[sshx] installer exit={result.exit_code} stdout={( result.stdout or '')[:300]}")
+
+        # 4. Check the exact path the installer always uses
+        direct = _exec(inst, ["bash", "-c",
+                               "[ -f /root/.local/bin/sshx ] && [ -x /root/.local/bin/sshx ] "
+                               "&& echo FOUND || echo NOPE"],
+                       environment=env)
+        if "FOUND" in (direct.stdout or ""):
+            _exec(inst, ["bash", "-c",
+                         f"chmod +x /root/.local/bin/sshx && ln -sf /root/.local/bin/sshx {_SSHX_BIN}"],
+                  environment=env)
+            print(f"[sshx] symlinked /root/.local/bin/sshx → {_SSHX_BIN}")
+            return True
+
+        # 5. Fallback: /usr/local/bin directly (some installer versions)
+        fallback = _exec(inst, ["bash", "-c",
+                                 "[ -f /usr/local/bin/sshx ] && [ -x /usr/local/bin/sshx ] "
+                                 "&& echo FOUND || echo NOPE"],
+                         environment=env)
+        if "FOUND" in (fallback.stdout or ""):
+            print("[sshx] found at /usr/local/bin/sshx")
+            return True
+
+        print("[sshx] binary not found after install — dumping ls:")
+        ls = _exec(inst, ["bash", "-c",
+                           "ls -la /root/.local/bin/ 2>/dev/null; "
+                           "ls -la /usr/local/bin/sshx 2>/dev/null || true"],
+                   environment=env)
+        print(f"[sshx] ls: {(ls.stdout or '(empty)')[:400]}")
+        return False
+
+    except Exception as e:
+        print(f"[sshx install] exception: {e}")
+        return False
+
+
+def _start_sshx_session(inst) -> str | None:
+    env = _CONTAINER_ENV
+    try:
+        # Kill any stale session, clear log
         _exec(inst, ["bash", "-c",
-                     "NO_COLOR=1 TERM=dumb nohup sshx > /tmp/sshx.log 2>&1 < /dev/null & disown"])
-        # Wait up to 30s for sshx to print its link
-        for tick in range(30):
+                     "pkill -f sshx 2>/dev/null; sleep 1; rm -f /tmp/sshx.log; true"],
+              environment=env)
+
+        # Launch with explicit full path so nohup doesn't miss it
+        launch_cmd = (
+            f"nohup {_SSHX_BIN} > /tmp/sshx.log 2>&1 < /dev/null & disown; echo launched"
+        )
+        launch_result = _exec(inst, ["bash", "-c", launch_cmd], environment=env)
+        print(f"[sshx] launch: {(launch_result.stdout or '').strip()[:80]}")
+
+        # Wait up to 45s — sshx.io can be slow on first connect
+        for tick in range(45):
             time.sleep(1)
-            result    = _exec(inst, ["bash", "-c", "cat /tmp/sshx.log 2>/dev/null || true"])
+            result    = _exec(inst, ["bash", "-c", "cat /tmp/sshx.log 2>/dev/null || true"],
+                              environment=env)
             raw_log   = result.stdout or ""
             clean_log = ANSI_ESCAPE_RE.sub("", raw_log)
             match     = SSHX_LINK_RE.search(clean_log)
             if match:
-                print(f"[sshx] session link found after {tick+1}s")
+                print(f"[sshx] link found after {tick+1}s: {match.group(0)}")
                 return match.group(0)
-            # Log progress every 5s
-            if (tick+1) % 5 == 0:
-                print(f"[sshx] waiting for link... {tick+1}s elapsed")
+            if (tick + 1) % 10 == 0:
+                print(f"[sshx] still waiting... {tick+1}s")
                 if raw_log.strip():
-                    print(f"[sshx] log tail: {raw_log.strip()[-200:]}")
-        print("[sshx] timed out after 30s — no link found in log")
+                    print(f"[sshx] log: {raw_log.strip()[-300:]}")
+
+        print("[sshx] timed out — no link in 45s")
         return None
     except Exception as e:
         print(f"[sshx session] {e}")
@@ -630,13 +705,14 @@ def regen_sshx(container_id: str) -> str | None:
     inst = _get_container(container_id)
     if not inst:
         raise RuntimeError("Container not found")
-    # Ensure sshx is installed before trying to start a session
-    env = {"HOME": "/root", "DEBIAN_FRONTEND": "noninteractive"}
-    find_cmd = "command -v sshx || ls /root/.local/bin/sshx /usr/local/bin/sshx 2>/dev/null | head -1"
-    check = _exec(inst, ["bash", "-c", find_cmd], environment=env)
-    if not (check.stdout or "").strip():
-        print("[regen_sshx] sshx not found — attempting install first")
-        _install_sshx(inst)
+    # Always re-check installation first
+    check = _exec(inst, ["bash", "-c", _SSHX_SEARCH_CMD], environment=_CONTAINER_ENV)
+    found = [f.strip() for f in (check.stdout or "").strip().splitlines()
+             if f.strip() and "find:" not in f]
+    if not found:
+        print("[regen_sshx] not installed — reinstalling")
+        if not _install_sshx(inst):
+            return None
     return _start_sshx_session(inst)
 
 
