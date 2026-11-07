@@ -160,16 +160,19 @@ cd "${INSTALL_DIR}"
 banner "Installing Python Dependencies"
 
 info "Upgrading pip..."
-python3 -m pip install --upgrade pip -q
+python3 -m pip install --upgrade pip -q --break-system-packages 2>/dev/null || \
+    python3 -m pip install --upgrade pip -q
 
 info "Installing bot requirements..."
-python3 -m pip install -r requirements.txt -q
+python3 -m pip install -r requirements.txt -q --break-system-packages 2>/dev/null || \
+    python3 -m pip install -r requirements.txt -q
 ok "Python dependencies installed"
 
 # ── Verify LXD Python binding ─────────────────────────────────────────────────
 if ! python3 -c "import pylxd" 2>/dev/null; then
     info "Installing pylxd..."
-    python3 -m pip install pylxd -q
+    python3 -m pip install pylxd -q --break-system-packages 2>/dev/null || \
+        python3 -m pip install pylxd -q
     ok "pylxd installed"
 else
     ok "pylxd already available"
