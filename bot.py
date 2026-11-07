@@ -137,73 +137,149 @@ def is_admin_discord(discord_id: str) -> bool:
 class PinggyTunnel:
     """
     Launches a Pinggy reverse SSH tunnel inside a container.
-    Returns the public host:port for SSH access.
-    Pinggy free tier: ssh -p 443 -R0:localhost:22 a.pinggy.io
+    Public SSH access via: ssh root@HOST -p PORT
+
+    Pinggy prints forwarded addresses like:
+      tcp://rndfoo.a.pinggy.link:PORT
+    or in older output:
+      Forwarding TCP connections from tcp://HOST:PORT
+    or just:
+      HOST:PORT
+    We match all three patterns.
     """
+
+    # All known Pinggy URL patterns
+    _URL_PATTERNS = [
+        # tcp://something.a.pinggy.link:12345
+        re.compile(r"tcp://([a-zA-Z0-9.\-]+\.pinggy\.(?:link|io)):(\d+)", re.IGNORECASE),
+        # tcp://something.a.pinggy.online:12345  (older domains)
+        re.compile(r"tcp://([a-zA-Z0-9.\-]+):(\d{4,5})", re.IGNORECASE),
+        # Forwarding TCP connections from tcp://HOST:PORT
+        re.compile(r"[Ff]orwarding.*?([a-zA-Z0-9.\-]+):(\d{4,5})", re.IGNORECASE),
+        # bare HOST:PORT on its own line
+        re.compile(r"^([a-zA-Z0-9.\-]+\.(?:pinggy\.link|pinggy\.io|pinggy\.online)):(\d{4,5})$",
+                   re.MULTILINE | re.IGNORECASE),
+    ]
+
+    @staticmethod
+    def _parse_url(log: str) -> tuple[str, int] | None:
+        for pattern in PinggyTunnel._URL_PATTERNS:
+            m = pattern.search(log)
+            if m:
+                host = m.group(1).strip()
+                port = int(m.group(2).strip())
+                if 1024 <= port <= 65535:
+                    return host, port
+        return None
 
     @staticmethod
     def install_and_start(container_id: str, pinggy_token: str = None) -> dict:
         """
-        Install openssh-server if needed, start Pinggy tunnel.
-        Returns {"host": str, "port": int, "url": str} or {"error": str}
+        Ensures openssh-server + ssh client are installed, starts Pinggy tunnel.
+        Returns {"host": str, "port": int, "url": str, "ssh_command": str} or {"error": str}
         """
-        from vps import _get_container, _exec, _apt_install_with_retry
+        from vps import _get_container, _exec, _apt_install_with_retry, _CONTAINER_ENV, _fix_container_dns
 
         inst = _get_container(container_id)
         if not inst:
             return {"error": "Container not found"}
 
-        env = {"HOME": "/root", "DEBIAN_FRONTEND": "noninteractive"}
+        env = _CONTAINER_ENV
 
-        # Ensure openssh-server is installed
-        check = _exec(inst, ["bash", "-c", "command -v sshd || echo MISSING"], environment=env)
-        if "MISSING" in (check.stdout or ""):
+        # ── Fix DNS before any network call ──────────────────────────────────
+        _fix_container_dns(inst)
+
+        # ── Ensure openssh-server is running ─────────────────────────────────
+        sshd_check = _exec(inst, ["bash", "-c",
+                                   "command -v sshd && echo PRESENT || echo MISSING"],
+                           environment=env)
+        if "MISSING" in (sshd_check.stdout or ""):
+            print("[pinggy] installing openssh-server...")
             _apt_install_with_retry(inst, "openssh-server", env)
-            _exec(inst, ["bash", "-c", "service ssh start || systemctl start ssh || true"], environment=env)
 
-        # Ensure ssh client is in container (for pinggy tunnel)
-        check_ssh = _exec(inst, ["bash", "-c", "command -v ssh || echo MISSING"], environment=env)
-        if "MISSING" in (check_ssh.stdout or ""):
+        # Start sshd regardless — idempotent
+        _exec(inst, ["bash", "-c",
+                     "service ssh start 2>/dev/null || systemctl start ssh 2>/dev/null || true"],
+              environment=env)
+
+        # Verify sshd is actually listening on port 22
+        for _ in range(10):
+            check = _exec(inst, ["bash", "-c", "ss -tnlp | grep ':22' || netstat -tnlp 2>/dev/null | grep ':22'"],
+                          environment=env)
+            if check.stdout and ":22" in check.stdout:
+                break
+            time.sleep(1)
+        else:
+            print("[pinggy] WARNING: sshd may not be listening on port 22")
+
+        # ── Ensure openssh-client (ssh binary) ───────────────────────────────
+        ssh_check = _exec(inst, ["bash", "-c", "command -v ssh && echo PRESENT || echo MISSING"],
+                          environment=env)
+        if "MISSING" in (ssh_check.stdout or ""):
+            print("[pinggy] installing openssh-client...")
             _apt_install_with_retry(inst, "openssh-client", env)
 
-        # Build pinggy command
-        # Format: ssh -p 443 -R0:localhost:22 -o StrictHostKeyChecking=no TOKEN+tcp@a.pinggy.io
+        # ── Kill any existing Pinggy tunnel ───────────────────────────────────
+        _exec(inst, ["bash", "-c",
+                     "pkill -f 'a.pinggy.io' 2>/dev/null; "
+                     "pkill -f 'pinggy' 2>/dev/null; "
+                     "rm -f /tmp/pinggy.log; sleep 1; true"],
+              environment=env)
+
+        # ── Build Pinggy SSH command ──────────────────────────────────────────
         if pinggy_token:
             remote_target = f"{pinggy_token}+tcp@a.pinggy.io"
         else:
             remote_target = "tcp@a.pinggy.io"
 
         tunnel_cmd = (
-            f"pkill -f 'pinggy_tunnel' 2>/dev/null; "
-            f"rm -f /tmp/pinggy.log; "
             f"nohup ssh -p 443 "
             f"-R0:localhost:22 "
             f"-o StrictHostKeyChecking=no "
-            f"-o ServerAliveInterval=30 "
-            f"-o ServerAliveCountMax=3 "
+            f"-o UserKnownHostsFile=/dev/null "
+            f"-o ServerAliveInterval=25 "
+            f"-o ServerAliveCountMax=5 "
             f"-o ExitOnForwardFailure=yes "
             f"-o LogLevel=VERBOSE "
+            f"-o BatchMode=yes "
             f"{remote_target} "
-            f"> /tmp/pinggy.log 2>&1 & "
-            f"echo $!"
+            f"> /tmp/pinggy.log 2>&1 & echo $!"
         )
 
-        _exec(inst, ["bash", "-c", tunnel_cmd], environment=env)
+        launch = _exec(inst, ["bash", "-c", tunnel_cmd], environment=env)
+        pid = (launch.stdout or "").strip()
+        print(f"[pinggy] tunnel launched pid={pid}")
 
-        # Wait for Pinggy to print the tunnel URL (up to 20s)
-        pinggy_url_re = re.compile(r"tcp://([a-z0-9.\-]+):(\d+)", re.IGNORECASE)
-        for tick in range(20):
+        # ── Wait for Pinggy to print the forwarded address ───────────────────
+        for tick in range(30):
             time.sleep(1)
-            log_result = _exec(inst, ["bash", "-c", "cat /tmp/pinggy.log 2>/dev/null || true"], environment=env)
-            log = log_result.stdout or ""
-            match = pinggy_url_re.search(log)
-            if match:
-                host = match.group(1)
-                port = int(match.group(2))
-                url  = f"tcp://{host}:{port}"
-                return {"host": host, "port": port, "url": url}
+            log_r = _exec(inst, ["bash", "-c", "cat /tmp/pinggy.log 2>/dev/null || true"],
+                          environment=env)
+            log = log_r.stdout or ""
 
-        return {"error": "Pinggy tunnel timed out — container is running but no public URL obtained"}
+            if log.strip():
+                result = PinggyTunnel._parse_url(log)
+                if result:
+                    host, port = result
+                    url = f"tcp://{host}:{port}"
+                    ssh_command = f"ssh root@{host} -p {port}"
+                    print(f"[pinggy] tunnel ready after {tick+1}s: {ssh_command}")
+                    return {
+                        "host": host,
+                        "port": port,
+                        "url": url,
+                        "ssh_command": ssh_command,
+                    }
+
+                # Print log every 5s for debugging
+                if (tick + 1) % 5 == 0:
+                    print(f"[pinggy] waiting {tick+1}s, log tail: {log.strip()[-400:]}")
+
+        # Last-ditch: dump the full log so we can debug
+        final_log = _exec(inst, ["bash", "-c", "cat /tmp/pinggy.log 2>/dev/null || true"],
+                          environment=env)
+        print(f"[pinggy] TIMEOUT — full log:\n{(final_log.stdout or '(empty)')[:1000]}")
+        return {"error": "Pinggy tunnel timed out — no forwarded address found in 30s"}
 
     @staticmethod
     def regen_tunnel(container_id: str, pinggy_token: str = None) -> dict:
@@ -478,6 +554,43 @@ class VPSControlView(discord.ui.View):
             f"🖥️ **Browser Terminal:** [Open sshx]({url})", ephemeral=True
         )
 
+    @discord.ui.button(label="🔄 Regen Pinggy", style=discord.ButtonStyle.secondary)
+    async def regen_pinggy_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("❌ Not your VPS.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        db = get_db()
+        vps = db.execute("SELECT * FROM vps WHERE id=?", (self.vps_id,)).fetchone()
+        db.close()
+        if not vps:
+            await interaction.followup.send("❌ VPS not found.", ephemeral=True)
+            return
+
+        await interaction.followup.send("🔄 Regenerating Pinggy tunnel... ~30s.", ephemeral=True)
+        cfg = load_config()
+        pinggy_token = cfg.get("pinggy_token", "")
+        result = await asyncio.to_thread(
+            PinggyTunnel.regen_tunnel, vps["container_id"], pinggy_token or None
+        )
+        if "error" in result:
+            await interaction.followup.send(f"❌ Failed: {result['error']}", ephemeral=True)
+            return
+
+        host = result["host"]
+        port = result["port"]
+        ssh_cmd = result.get("ssh_command", f"ssh root@{host} -p {port}")
+        db = get_db()
+        db.execute("UPDATE vps SET ssh_host=?,ssh_port=?,pinggy_url=? WHERE id=?",
+                   (host, port, result["url"], self.vps_id))
+        db.commit()
+        db.close()
+        await interaction.followup.send(
+            f"✅ **New Pinggy tunnel:**\n`{ssh_cmd}`\n"
+            f"Password: `{vps['ssh_password']}`",
+            ephemeral=True
+        )
+
     @discord.ui.button(label="🔄 Regen sshx", style=discord.ButtonStyle.secondary)
     async def regen_sshx_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._check_owner(interaction):
@@ -612,13 +725,15 @@ class AdminVPSView(discord.ui.View):
 # ── Slash Commands ────────────────────────────────────────────────────────────
 
 @tree.command(name="vps", description="Create or manage your VPS")
-@app_commands.describe(action="Action to perform: create, status, delete, reinstall")
+@app_commands.describe(action="Action to perform")
 @app_commands.choices(action=[
     app_commands.Choice(name="create", value="create"),
     app_commands.Choice(name="status", value="status"),
     app_commands.Choice(name="delete", value="delete"),
     app_commands.Choice(name="reinstall", value="reinstall"),
     app_commands.Choice(name="credentials", value="credentials"),
+    app_commands.Choice(name="regen_pinggy", value="regen_pinggy"),
+    app_commands.Choice(name="regen_sshx", value="regen_sshx"),
 ])
 async def vps_command(interaction: discord.Interaction, action: str):
     discord_id = str(interaction.user.id)
@@ -640,6 +755,12 @@ async def vps_command(interaction: discord.Interaction, action: str):
 
     elif action == "credentials":
         await _handle_credentials(interaction, discord_id, logo_url, bot_name)
+
+    elif action == "regen_pinggy":
+        await _handle_regen_pinggy(interaction, discord_id)
+
+    elif action == "regen_sshx":
+        await _handle_regen_sshx_cmd(interaction, discord_id)
 
 
 async def _handle_create(interaction: discord.Interaction, discord_id: str, cfg: dict):
@@ -898,6 +1019,99 @@ async def _handle_credentials(interaction: discord.Interaction, discord_id: str,
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+async def _handle_regen_pinggy(interaction: discord.Interaction, discord_id: str):
+    await interaction.response.defer(ephemeral=True)
+    db = get_db()
+    vps = db.execute(
+        "SELECT * FROM vps WHERE discord_id=? AND status='running' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (discord_id,)
+    ).fetchone()
+    db.close()
+
+    if not vps:
+        await interaction.followup.send("❌ No running VPS found.", ephemeral=True)
+        return
+
+    await interaction.followup.send("🔄 Regenerating Pinggy tunnel... this takes ~30s.", ephemeral=True)
+
+    cfg = load_config()
+    pinggy_token = cfg.get("pinggy_token", "")
+
+    result = await asyncio.to_thread(
+        PinggyTunnel.regen_tunnel, vps["container_id"], pinggy_token or None
+    )
+
+    if "error" in result:
+        await interaction.followup.send(f"❌ Pinggy regen failed: {result['error']}", ephemeral=True)
+        return
+
+    host = result["host"]
+    port = result["port"]
+    url  = result["url"]
+    ssh_cmd = result.get("ssh_command", f"ssh root@{host} -p {port}")
+
+    db = get_db()
+    db.execute(
+        "UPDATE vps SET ssh_host=?,ssh_port=?,pinggy_url=? WHERE id=?",
+        (host, port, url, vps["id"])
+    )
+    db.commit()
+    db.close()
+
+    cfg2 = load_config()
+    embed = discord.Embed(
+        title="🔄 Pinggy Tunnel Regenerated",
+        color=0x00FF88,
+    )
+    embed.add_field(name="SSH Command", value=f"`{ssh_cmd}`", inline=False)
+    embed.add_field(name="Host", value=f"`{host}`", inline=True)
+    embed.add_field(name="Port", value=f"`{port}`", inline=True)
+    embed.add_field(name="Username", value="`root`", inline=True)
+    embed.add_field(name="Password", value=f"`{vps['ssh_password']}`", inline=True)
+    embed.set_footer(text=cfg2.get("bot_name", "VPS Bot"))
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _handle_regen_sshx_cmd(interaction: discord.Interaction, discord_id: str):
+    await interaction.response.defer(ephemeral=True)
+    db = get_db()
+    vps = db.execute(
+        "SELECT * FROM vps WHERE discord_id=? AND status='running' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (discord_id,)
+    ).fetchone()
+    db.close()
+
+    if not vps:
+        await interaction.followup.send("❌ No running VPS found.", ephemeral=True)
+        return
+
+    if time.time() - (vps["last_regen"] or 0) < 30:
+        await interaction.followup.send("⏳ Wait 30s between regenerations.", ephemeral=True)
+        return
+
+    await interaction.followup.send("🔄 Regenerating sshx terminal link... up to 45s.", ephemeral=True)
+
+    new_url = await asyncio.to_thread(regen_sshx, vps["container_id"])
+    if new_url:
+        db = get_db()
+        db.execute("UPDATE vps SET sshx_url=?,last_regen=? WHERE id=?",
+                   (new_url, int(time.time()), vps["id"]))
+        db.commit()
+        db.close()
+        await interaction.followup.send(
+            f"✅ **sshx terminal regenerated!**\n[Open Browser Terminal]({new_url})",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            "❌ sshx link could not be regenerated. The container is still accessible via SSH.",
+            ephemeral=True
+        )
+
+
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, discord_id: str, vps_id: int, container_id: str):
         super().__init__(timeout=60)
@@ -930,7 +1144,7 @@ class ConfirmDeleteView(discord.ui.View):
 @tree.command(name="admin", description="Admin VPS management")
 @app_commands.describe(
     action="Admin action",
-    user="Discord user to target",
+    user_id="Target user's Discord ID (17–19 digit number — right-click user → Copy ID)",
     note="Optional note"
 )
 @app_commands.choices(action=[
@@ -945,45 +1159,56 @@ class ConfirmDeleteView(discord.ui.View):
     app_commands.Choice(name="config", value="config"),
 ])
 async def admin_command(interaction: discord.Interaction, action: str,
-                         user: discord.Member = None, note: str = ""):
+                        user_id: str = None, note: str = ""):
     if not is_admin_discord(str(interaction.user.id)):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    # Validate user_id format when provided
+    if user_id is not None:
+        user_id = user_id.strip().lstrip("<@!").rstrip(">")  # strip @mention format too
+        if not user_id.isdigit():
+            await interaction.response.send_message(
+                "❌ `user_id` must be a numeric Discord user ID (17–19 digits).\n"
+                "Enable Developer Mode → right-click any user → **Copy User ID**.",
+                ephemeral=True
+            )
+            return
+
+    # Resolve display name for actions that need it
+    target_name = user_id or "unknown"
+    if user_id:
+        try:
+            target_user = await bot.fetch_user(int(user_id))
+            target_name = str(target_user)
+        except Exception:
+            pass
+
+    needs_user = {"grant", "delete", "suspend", "unsuspend", "approve", "deny"}
+    if action in needs_user and not user_id:
+        await interaction.response.send_message(
+            f"❌ `/admin {action}` requires a `user_id`.\n"
+            f"Right-click the user in Discord → **Copy User ID**, then paste it.",
+            ephemeral=True
+        )
         return
 
     if action == "list":
         await _admin_list(interaction)
     elif action == "grant":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_grant(interaction, str(user.id), str(user))
+        await _admin_grant(interaction, user_id, target_name)
     elif action == "delete":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_delete(interaction, str(user.id))
+        await _admin_delete(interaction, user_id)
     elif action == "suspend":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_suspend(interaction, str(user.id))
+        await _admin_suspend(interaction, user_id)
     elif action == "unsuspend":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_unsuspend(interaction, str(user.id))
+        await _admin_unsuspend(interaction, user_id)
     elif action == "requests":
         await _admin_list_requests(interaction)
     elif action == "approve":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_approve_request(interaction, str(user.id), str(user))
+        await _admin_approve_request(interaction, user_id, target_name)
     elif action == "deny":
-        if not user:
-            await interaction.response.send_message("❌ Specify a user.", ephemeral=True)
-            return
-        await _admin_deny_request(interaction, str(user.id))
+        await _admin_deny_request(interaction, user_id)
     elif action == "config":
         await _admin_config(interaction)
 
