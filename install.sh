@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VPS Discord Bot — One-Command Installer
-# Usage: bash <(curl -s https://raw.githubusercontent.com/YOUR_REPO/main/install.sh)
+# Usage: bash <(curl -s https://raw.githubusercontent.com/rrs803465-ai/vps-discord-bot/main/install.sh)
 #
 # This script:
 #   1. Checks system requirements
@@ -18,8 +18,8 @@ WARN='\033[0;33m'
 ERR='\033[0;31m'
 RST='\033[0m'
 
-REPO_URL="https://github.com/YOUR_USERNAME/vps-discord-bot"
-RAW_BASE="https://raw.githubusercontent.com/YOUR_USERNAME/vps-discord-bot/main"
+REPO_URL="https://github.com/rrs803465-ai/vps-discord-bot"
+RAW_BASE="https://raw.githubusercontent.com/rrs803465-ai/vps-discord-bot/main"
 INSTALL_DIR="/opt/vps-discord-bot"
 
 FILES=(
